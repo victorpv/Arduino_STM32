@@ -4,8 +4,8 @@
 #include "wiring_private.h"
 #include <SPI.h>
 
-SPIClass tftSPI(2);
-//#define tftSPI SPI
+//SPIClass tftSPI(2);
+#define tftSPI SPI
 
 //constructors
 TFT_ILI9163C::TFT_ILI9163C(uint8_t cspin,uint8_t dcpin,uint8_t rstpin) : Adafruit_GFX(_TFTWIDTH,_TFTHEIGHT){

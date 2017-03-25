@@ -99,6 +99,16 @@
 #define DATA_SIZE_8BIT SPI_CR1_DFF_8_BIT
 #define DATA_SIZE_16BIT SPI_CR1_DFF_16_BIT
 
+#define DMA_TIMEOUT 100
+
+typedef enum {
+		SPI_STATE_IDLE,
+		SPI_STATE_READY,
+		SPI_STATE_RECEIVE,
+		SPI_STATE_TRANSMIT,
+        SPI_STATE_TRANSFER
+	} spi_mode_t;
+
 class SPISettings {
 public:
 	SPISettings(uint32_t clock, BitOrder bitOrder, uint8_t dataMode) {
@@ -127,21 +137,33 @@ private:
 		this->dataSize = dataSize;
 	}
 	uint32_t clock;
+    uint32_t dataSize;
+    uint32_t clockDivider;
 	BitOrder bitOrder;
 	uint8_t dataMode;
-	uint32_t dataSize;
+    volatile spi_mode_t state;
 	
 	spi_dev *spi_d;
 	uint8_t _SSPin;
-	uint32_t clockDivider;
 	dma_channel spiRxDmaChannel, spiTxDmaChannel;
 	dma_dev* spiDmaDev;
+    void (*receiveCallback)(void) = NULL;
+    void (*transmitCallback)(void) = NULL;
 	
 	friend class SPIClass;
 };
 
+//volatile static bool dma1_ch3_Active;
 
-volatile static bool dma1_ch3_Active;
+/*
+    Should move this to within the class once tested out, just for tidyness
+*/
+static uint8_t ff = 0XFF;
+static void (*_spi1_this);
+static void (*_spi2_this);
+#if BOARD_NR_SPI >= 3
+static void (*_spi3_this);
+#endif
 
 /**
  * @brief Wirish SPI interface.
@@ -209,6 +231,11 @@ public:
 	*	Requires an added function spi_data_size on  STM32F1 / cores / maple / libmaple / spi.c 
 	*/
     void setDataSize(uint32 ds);
+    
+    /*  Added to set and clear callback functions
+    */
+    void onReceive(void(*)(void));
+	void onTransmit(void(*)(void));
 	
 	
     /*
@@ -272,6 +299,8 @@ public:
      * @param length Number of bytes in buffer to transmit.
 	 */
 	uint8 dmaTransfer(uint8 *transmitBuf, uint8 *receiveBuf, uint16 length);
+    void dmaTransferSet(uint8 *transmitBuf, uint8 *receiveBuf);
+    uint8 dmaTransferRepeat(uint16 length);
 
 	/**
      * @brief Sets up a DMA Transmit for bytes.
@@ -282,8 +311,11 @@ public:
      * @param length Number of bytes in buffer to transmit.
 	 * @param minc Set to use Memory Increment mode, clear to use Circular mode.
      */
-	uint8 dmaSend(uint8 *transmitBuf, uint16 length, bool minc = 1);
+	uint8 dmaSend(void *transmitBuf, uint16 length, bool minc = 1);
+    void dmaSendSet(void * transmitBuf, bool minc);
+    uint8 dmaSendRepeat(uint16 length);
 	
+
 	/**
      * @brief Sets up a DMA Transmit for half words.
 	 * SPI PERFIPHERAL MUST BE SET TO 16 BIT MODE BEFORE
@@ -294,7 +326,7 @@ public:
      * @param length Number of bytes in buffer to transmit.
      * @param minc Set to use Memory Increment mode (default if blank), clear to use Circular mode.
      */
-	uint8 dmaSend(uint16 *transmitBuf, uint16 length, bool minc = 1);
+	//uint8 dmaSend(uint16 *transmitBuf, uint16 length, bool minc = 1);
 
     /*
      * Pin accessors
@@ -391,6 +423,14 @@ private:
 	SPISettings *_currentSetting;
 	
 	void updateSettings(void);
+    
+    void EventCallback(void);
+    
+    static void _spi1EventCallback(void);
+    static void _spi2EventCallback(void);
+    #if BOARD_NR_SPI >= 3
+    static void _spi3EventCallback(void);
+    #endif
 	/*
 	spi_dev *spi_d;
 	uint8_t _SSPin;

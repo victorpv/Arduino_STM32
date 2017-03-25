@@ -99,16 +99,19 @@ SPIClass::SPIClass(uint32 spi_num) {
 #if BOARD_NR_SPI >= 1
     case 1:
         _currentSetting->spi_d = SPI1;
+        _spi1_this = (void*) this;
         break;
 #endif
 #if BOARD_NR_SPI >= 2
     case 2:
         _currentSetting->spi_d = SPI2;
+        _spi2_this = (void*) this;
         break;
 #endif
 #if BOARD_NR_SPI >= 3
     case 3:
         _currentSetting->spi_d = SPI3;
+        _spi3_this = (void*) this;
         break;
 #endif
     default:
@@ -136,6 +139,8 @@ SPIClass::SPIClass(uint32 spi_num) {
 #endif	
 	
 	//pinMode(BOARD_SPI_DEFAULT_SS,OUTPUT);
+    // added for DMA callbacks.
+    _currentSetting->state = SPI_STATE_IDLE;
 }
 
 /*
@@ -153,6 +158,8 @@ void SPIClass::begin(void) {
     spi_init(_currentSetting->spi_d);
     configure_gpios(_currentSetting->spi_d, 1);
     updateSettings();
+    // added for DMA callbacks.
+    _currentSetting->state = SPI_STATE_READY;
 }
 
 void SPIClass::beginSlave(void) {
@@ -163,6 +170,8 @@ void SPIClass::beginSlave(void) {
 	Serial.print("spi_slave_enable("); Serial.print(_currentSetting->dataMode); Serial.print(","); Serial.print(flags); Serial.println(")");
 	#endif
     spi_slave_enable(_currentSetting->spi_d, (spi_mode)_currentSetting->dataMode, flags);
+    // added for DMA callbacks.
+    _currentSetting->state = SPI_STATE_READY;
 }
 
 void SPIClass::end(void) {
@@ -181,6 +190,9 @@ void SPIClass::end(void) {
     while (spi_is_busy(_currentSetting->spi_d))
         ;
     spi_peripheral_disable(_currentSetting->spi_d);
+    // added for DMA callbacks.
+    // Need to add unsetting the callbacks for the DMA channels.
+    _currentSetting->state = SPI_STATE_IDLE;
 }
 
 /* Roger Clark added  3 functions */
@@ -361,6 +373,7 @@ void SPIClass::write(const uint8 *data, uint32 length) {
 }
 
 uint16_t SPIClass::transfer16(uint16_t wr_data) const {
+	if (spi_is_rx_nonempty(_currentSetting->spi_d) == 1) spi_rx_reg(_currentSetting->spi_d);
 	spi_tx_reg(_currentSetting->spi_d, wr_data); // "2. Write the first data item to be transmitted into the SPI_DR register (this clears the TXE flag)."
 	while (spi_is_rx_nonempty(_currentSetting->spi_d) == 0); // "4. Wait until RXNE=1 ..."
 	uint16_t rd_data = spi_rx_reg(_currentSetting->spi_d); // "... and read the last received data."
@@ -370,6 +383,7 @@ uint16_t SPIClass::transfer16(uint16_t wr_data) const {
 }
 
 uint8 SPIClass::transfer(uint8 byte) const {
+	if (spi_is_rx_nonempty(_currentSetting->spi_d) == 1) spi_rx_reg(_currentSetting->spi_d);
 	spi_tx_reg(_currentSetting->spi_d, byte); // "2. Write the first data item to be transmitted into the SPI_DR register (this clears the TXE flag)."
   	while (spi_is_rx_nonempty(_currentSetting->spi_d) == 0); // "4. Wait until RXNE=1 ..."
   	uint8 b = spi_rx_reg(_currentSetting->spi_d); // "... and read the last received data."
@@ -377,15 +391,79 @@ uint8 SPIClass::transfer(uint8 byte) const {
   	while (spi_is_busy(_currentSetting->spi_d) != 0); // "... and then wait until BSY=0 before disabling the SPI."
     return b;
 }
+
 /*  Roger Clark and Victor Perez, 2015
 *	Performs a DMA SPI transfer with at least a receive buffer.
 *	If a TX buffer is not provided, FF is sent over and over for the lenght of the transfer. 
 *	On exit TX buffer is not modified, and RX buffer cotains the received data.
 *	Still in progress.
 */
+
+void SPIClass::dmaTransferSet(uint8 *transmitBuf, uint8 *receiveBuf) {
+    dma_init(_currentSetting->spiDmaDev);
+	spi_rx_dma_enable(_currentSetting->spi_d);
+	spi_tx_dma_enable(_currentSetting->spi_d);
+	dma_xfer_size dma_bit_size = (_currentSetting->dataSize==DATA_SIZE_16BIT) ? DMA_SIZE_16BITS : DMA_SIZE_8BITS;
+	dma_setup_transfer(_currentSetting->spiDmaDev, _currentSetting->spiRxDmaChannel, &_currentSetting->spi_d->regs->DR, dma_bit_size,
+                     receiveBuf, dma_bit_size, (DMA_MINC_MODE | DMA_TRNS_CMPLT ));// receive buffer DMA
+	if (!transmitBuf) {
+	transmitBuf = &ff;
+	dma_setup_transfer(_currentSetting->spiDmaDev, _currentSetting->spiTxDmaChannel, &_currentSetting->spi_d->regs->DR, dma_bit_size,
+                       transmitBuf, dma_bit_size, (DMA_FROM_MEM));// Transmit FF repeatedly
+	}
+	else {
+    dma_setup_transfer(_currentSetting->spiDmaDev, _currentSetting->spiTxDmaChannel, &_currentSetting->spi_d->regs->DR, dma_bit_size,
+                       transmitBuf, dma_bit_size, (DMA_MINC_MODE |  DMA_FROM_MEM ));// Transmit buffer DMA
+	}
+	dma_set_priority(_currentSetting->spiDmaDev, _currentSetting->spiTxDmaChannel, DMA_PRIORITY_LOW);
+	dma_set_priority(_currentSetting->spiDmaDev, _currentSetting->spiRxDmaChannel, DMA_PRIORITY_VERY_HIGH);
+}
+
+uint8 SPIClass::dmaTransferRepeat(uint16 length) {
+	if (length == 0) return 0;
+	if (spi_is_rx_nonempty(_currentSetting->spi_d) == 1) spi_rx_reg(_currentSetting->spi_d);
+	_currentSetting->state = SPI_STATE_TRANSFER;
+	dma_set_num_transfers(_currentSetting->spiDmaDev, _currentSetting->spiRxDmaChannel, length);
+	dma_set_num_transfers(_currentSetting->spiDmaDev, _currentSetting->spiTxDmaChannel, length);
+	dma_enable(_currentSetting->spiDmaDev, _currentSetting->spiRxDmaChannel);// enable receive
+	dma_enable(_currentSetting->spiDmaDev, _currentSetting->spiTxDmaChannel);// enable transmit
+	//spi_rx_dma_enable(_currentSetting->spi_d);
+	//spi_tx_dma_enable(_currentSetting->spi_d);
+    if (_currentSetting->receiveCallback){
+        return 0;
+    }
+    //uint32_t m = millis();
+    uint8 b = 0;
+	while ((dma_get_isr_bits(_currentSetting->spiDmaDev, _currentSetting->spiRxDmaChannel) & 0x2)==0);
+	/*{//Avoid interrupts and just loop waiting for the flag to be set.
+      if ((millis() - m) > DMA_TIMEOUT)  {
+//        dma1_ch3_Active = 0;
+		b = 2;
+		break;
+      }
+    }*/
+
+	while (spi_is_tx_empty(_currentSetting->spi_d) == 0); // "5. Wait until TXE=1 ..."
+	while (spi_is_busy(_currentSetting->spi_d) != 0); // "... and then wait until BSY=0 before disabling the SPI."
+	//spi_tx_dma_disable(_currentSetting->spi_d);
+	//spi_rx_dma_disable(_currentSetting->spi_d);
+    dma_disable(_currentSetting->spiDmaDev, _currentSetting->spiTxDmaChannel);
+	dma_disable(_currentSetting->spiDmaDev, _currentSetting->spiRxDmaChannel);
+	dma_clear_isr_bits(_currentSetting->spiDmaDev, _currentSetting->spiRxDmaChannel);
+	dma_clear_isr_bits(_currentSetting->spiDmaDev, _currentSetting->spiTxDmaChannel);
+	_currentSetting->state = SPI_STATE_READY;
+    return b;
+}
+
+uint8 SPIClass::dmaTransfer(uint8 *transmitBuf, uint8 *receiveBuf, uint16 length) {
+	dmaTransferSet(transmitBuf, receiveBuf);
+	return dmaTransferRepeat(length);
+}
+/*
 uint8 SPIClass::dmaTransfer(uint8 *transmitBuf, uint8 *receiveBuf, uint16 length) {
 	if (length == 0) return 0;
 	uint8 b = 0;
+    spi_rx_reg(_currentSetting->spi_d); //Clear the RX buffer in case a byte is waiting on it.
 	if (spi_is_rx_nonempty(_currentSetting->spi_d) == 1) b = spi_rx_reg(_currentSetting->spi_d); //Clear the RX buffer in case a byte is waiting on it.
 //	dma1_ch3_Active=true;
     dma_init(_currentSetting->spiDmaDev);
@@ -403,11 +481,11 @@ uint8 SPIClass::dmaTransfer(uint8 *transmitBuf, uint8 *receiveBuf, uint16 length
 	static uint8_t ff = 0XFF;
 	transmitBuf = &ff;
 	dma_setup_transfer(_currentSetting->spiDmaDev, _currentSetting->spiTxDmaChannel, &_currentSetting->spi_d->regs->DR, DMA_SIZE_8BITS,
-                       transmitBuf, DMA_SIZE_8BITS, (DMA_FROM_MEM | DMA_TRNS_CMPLT));// Transmit FF repeatedly
+                       transmitBuf, DMA_SIZE_8BITS, (DMA_FROM_MEM ));// Transmit FF repeatedly
 	}
 	else {
     dma_setup_transfer(_currentSetting->spiDmaDev, _currentSetting->spiTxDmaChannel, &_currentSetting->spi_d->regs->DR, DMA_SIZE_8BITS,
-                       transmitBuf, DMA_SIZE_8BITS, (DMA_MINC_MODE |  DMA_FROM_MEM | DMA_TRNS_CMPLT));// Transmit buffer DMA 
+                       transmitBuf, DMA_SIZE_8BITS, (DMA_MINC_MODE |  DMA_FROM_MEM ));// Transmit buffer DMA
 	}
 	dma_set_num_transfers(_currentSetting->spiDmaDev, _currentSetting->spiTxDmaChannel, length);
 
@@ -418,7 +496,7 @@ uint8 SPIClass::dmaTransfer(uint8 *transmitBuf, uint8 *receiveBuf, uint16 length
 //	if (receiveBuf) {
     uint32_t m = millis();
 	while ((dma_get_isr_bits(_currentSetting->spiDmaDev, _currentSetting->spiTxDmaChannel) & 0x2)==0) {//Avoid interrupts and just loop waiting for the flag to be set.
-      if ((millis() - m) > 100)  {
+      if ((millis() - m) > DMA_TIMEOUT)  {
 //        dma1_ch3_Active = 0;
 		b = 2;
 		break;
@@ -438,12 +516,65 @@ uint8 SPIClass::dmaTransfer(uint8 *transmitBuf, uint8 *receiveBuf, uint16 length
 	}
     return b;
 }
+*/
 
 /*  Roger Clark and Victor Perez, 2015
 *	Performs a DMA SPI send using a TX buffer.
 *	On exit TX buffer is not modified.
 *	Still in progress.
 */
+
+uint8 SPIClass::dmaSendRepeat(uint16 length)
+{
+    if (length == 0) return 1;
+    dma_set_num_transfers(_currentSetting->spiDmaDev, _currentSetting->spiTxDmaChannel, length);
+    _currentSetting->state = SPI_STATE_TRANSMIT;
+    dma_enable(_currentSetting->spiDmaDev, _currentSetting->spiTxDmaChannel);// enable transmit
+    //spi_tx_dma_enable(_currentSetting->spi_d);
+    if (_currentSetting->transmitCallback){
+        return 0;
+    }
+    //uint32_t m = millis();
+    uint8 b = 0;
+    while ((dma_get_isr_bits(_currentSetting->spiDmaDev, _currentSetting->spiTxDmaChannel) & DMA_ISR_TCIF1)==0);
+    /*{//Avoid interrupts and just loop waiting for the flag to be set.
+        if ((millis() - m) > DMA_TIMEOUT) { b = 2; break; }
+    }*/
+
+    dma_disable(_currentSetting->spiDmaDev, _currentSetting->spiTxDmaChannel);
+    dma_clear_isr_bits(_currentSetting->spiDmaDev, _currentSetting->spiTxDmaChannel);
+    while (spi_is_tx_empty(_currentSetting->spi_d) == 0); // "5. Wait until TXE=1 ..."
+    while (spi_is_busy(_currentSetting->spi_d) != 0); // "... and then wait until BSY=0 before disabling the SPI." 
+    //spi_tx_dma_disable(_currentSetting->spi_d);
+
+    _currentSetting->state = SPI_STATE_READY;
+    /*
+        Next instruction probably not needed, since the channel is disabled, but safer to disable port requests.
+    */
+    //spi_tx_dma_disable(_currentSetting->spi_d);
+    //uint16 x = spi_rx_reg(_currentSetting->spi_d); // dummy read, needed, don't remove!
+    return b;
+}
+
+void SPIClass::dmaSendSet(void * transmitBuf, bool minc)
+{
+   uint32 flags = ( (DMA_MINC_MODE*minc) | DMA_FROM_MEM | DMA_TRNS_CMPLT);
+   dma_init(_currentSetting->spiDmaDev);
+   // TX
+   spi_tx_dma_enable(_currentSetting->spi_d);
+   dma_xfer_size dma_bit_size = (_currentSetting->dataSize==DATA_SIZE_16BIT) ? DMA_SIZE_16BITS : DMA_SIZE_8BITS;
+   dma_setup_transfer(_currentSetting->spiDmaDev, _currentSetting->spiTxDmaChannel, &_currentSetting->spi_d->regs->DR, dma_bit_size,
+                       transmitBuf, dma_bit_size, flags);// Transmit buffer DMA
+   dma_set_priority(_currentSetting->spiDmaDev, _currentSetting->spiTxDmaChannel, DMA_PRIORITY_LOW);
+}
+
+uint8 SPIClass::dmaSend(void * transmitBuf, uint16 length, bool minc)
+{
+    dmaSendSet(transmitBuf, minc);
+    return dmaSendRepeat(length);
+}
+
+/*
 uint8 SPIClass::dmaSend(uint8 *transmitBuf, uint16 length, bool minc) {
 	if (length == 0) return 0;
 	uint32 flags = ((DMA_MINC_MODE * minc) |  DMA_FROM_MEM | DMA_TRNS_CMPLT);
@@ -476,7 +607,7 @@ uint8 SPIClass::dmaSend(uint8 *transmitBuf, uint16 length, bool minc) {
 uint8 SPIClass::dmaSend(uint16 *transmitBuf, uint16 length, bool minc) {
 	if (length == 0) return 0;
 	uint32 flags = ((DMA_MINC_MODE * minc) |  DMA_FROM_MEM | DMA_TRNS_CMPLT);
-	uint8 b;
+	uint8 b = 0;
 	dma1_ch3_Active=true;
     dma_init(_currentSetting->spiDmaDev);
 //	dma_attach_interrupt(DMA1, DMA_CH3, &SPIClass::DMA1_CH3_Event);
@@ -500,6 +631,101 @@ uint8 SPIClass::dmaSend(uint16 *transmitBuf, uint16 length, bool minc) {
 		b = spi_rx_reg(_currentSetting->spi_d); // "... and read the last received data."
 	}
     return b;
+}
+*/
+
+/*
+    New functions added to manage callbacks.
+    Victor Perez 2017
+*/
+
+void SPIClass::onReceive(void(*callback)(void))
+{
+    _currentSetting->receiveCallback = callback;
+    if (callback){
+        switch (_currentSetting->spi_d->clk_id) {
+		case RCC_SPI1:
+        dma_attach_interrupt(_currentSetting->spiDmaDev, _currentSetting->spiRxDmaChannel, &SPIClass::_spi1EventCallback);
+        break;
+		case RCC_SPI2:
+        dma_attach_interrupt(_currentSetting->spiDmaDev, _currentSetting->spiRxDmaChannel, &SPIClass::_spi2EventCallback);
+        break;
+        #if BOARD_NR_SPI >= 3
+		case RCC_SPI3:
+        dma_attach_interrupt(_currentSetting->spiDmaDev, _currentSetting->spiRxDmaChannel, &SPIClass::_spi3EventCallback);
+        break;
+        #endif
+		default:
+        ASSERT(0);
+        }
+    }
+    else {
+        dma_detach_interrupt(_currentSetting->spiDmaDev, _currentSetting->spiRxDmaChannel);
+    }
+}
+
+void SPIClass::onTransmit(void(*callback)(void))
+{
+    _currentSetting->transmitCallback = callback;
+    if (callback){
+        switch (_currentSetting->spi_d->clk_id) {
+		case RCC_SPI1:
+        dma_attach_interrupt(_currentSetting->spiDmaDev, _currentSetting->spiTxDmaChannel, &SPIClass::_spi1EventCallback);
+        break;
+		case RCC_SPI2:
+        dma_attach_interrupt(_currentSetting->spiDmaDev, _currentSetting->spiTxDmaChannel, &SPIClass::_spi2EventCallback);
+        break;
+        #if BOARD_NR_SPI >= 3
+		case RCC_SPI3:
+        dma_attach_interrupt(_currentSetting->spiDmaDev, _currentSetting->spiTxDmaChannel, &SPIClass::_spi3EventCallback);
+        break;
+        #endif
+		default:
+        ASSERT(0);
+        }
+    }
+    else {
+        dma_detach_interrupt(_currentSetting->spiDmaDev, _currentSetting->spiTxDmaChannel);
+    }
+}
+
+/*
+    TODO: check if better to first call the customer code, next disable the DMA requests.
+    Also check if we need to check whether callbacks are set or not, may be better to be checked during the initial setup and only set the callback to EventCallback if they are set.
+*/
+
+void SPIClass::EventCallback()
+{
+    while (spi_is_tx_empty(_currentSetting->spi_d) == 0); // "5. Wait until TXE=1 ..."
+    while (spi_is_busy(_currentSetting->spi_d) != 0); // "... and then wait until BSY=0"
+    switch (_currentSetting->state) {
+        case SPI_STATE_TRANSFER:
+        	while (spi_is_rx_nonempty(_currentSetting->spi_d));
+            _currentSetting->state = SPI_STATE_READY;
+            //spi_tx_dma_disable(_currentSetting->spi_d);
+            //spi_rx_dma_disable(_currentSetting->spi_d);
+            //dma_disable(_currentSetting->spiDmaDev, _currentSetting->spiTxDmaChannel);
+            //dma_disable(_currentSetting->spiDmaDev, _currentSetting->spiRxDmaChannel);
+
+        	if (_currentSetting->receiveCallback)
+			{
+				_currentSetting->receiveCallback();
+			}
+		break;
+		case SPI_STATE_TRANSMIT:
+            _currentSetting->state = SPI_STATE_READY;
+            //spi_tx_dma_disable(_currentSetting->spi_d);
+            //dma_disable(_currentSetting->spiDmaDev, _currentSetting->spiTxDmaChannel);
+            if (_currentSetting->transmitCallback)
+			{
+				_currentSetting->transmitCallback();
+			}
+
+		break;
+		default:
+        // we shouldn't get here, so better to add an assert and fail.
+		return;
+	}
 }
 
 
@@ -554,6 +780,25 @@ uint8 SPIClass::recv(void) {
     return this->read();
 }
 
+/*
+    DMA call back functions, one per port.
+*/
+
+void SPIClass::_spi1EventCallback()
+{
+    reinterpret_cast<class SPIClass*>(_spi1_this)->EventCallback();
+}
+
+void SPIClass::_spi2EventCallback()
+{
+    reinterpret_cast<class SPIClass*>(_spi2_this)->EventCallback();
+}
+#if BOARD_NR_SPI >= 3
+void SPIClass::_spi3EventCallback()
+{
+    reinterpret_cast<class SPIClass*>(_spi3_this)->EventCallback();
+}
+#endif
 
 /*
  * Auxiliary functions

@@ -320,19 +320,19 @@ void TMRpcm_play(char* filename, unsigned long seekPoint){
   	  	Serial.println(TMRpcm_sample_RATE);
   	#endif
   	}
-	if(TMRpcm_sample_RATE = 48000 ){
+	if(TMRpcm_sample_RATE == 48000 ){
 		resolution = 260; //250
 		repetition = 5;
 	}
-	else if(TMRpcm_sample_RATE = 44100 ){
+	else if(TMRpcm_sample_RATE == 44100 ){
 		resolution = 285; //272
 		repetition = 5;
 	}
-	else if(TMRpcm_sample_RATE = 22050 ){
+	else if(TMRpcm_sample_RATE == 22050 ){
 		resolution = 285; //272
 		repetition = 11;
 	}
-	else if(TMRpcm_sample_RATE = 8000 ){
+	else if(TMRpcm_sample_RATE == 8000 ){
 		resolution = 260; //250
 		repetition = 35;
 	}
